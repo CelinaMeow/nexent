@@ -271,7 +271,33 @@ persist_deploy_options() {
   } > "$DEPLOY_OPTIONS_FILE"
 }
 
+get_env_var_from_file() {
+  local key="$1"
+  local env_file="${2:-.env}"
+
+  if [ ! -f "$env_file" ]; then
+    echo ""
+    return
+  fi
+
+  local line
+  line=$(grep -E "^${key}=" "$env_file" | tail -n 1 || true)
+  if [ -z "$line" ]; then
+    echo ""
+    return
+  fi
+
+  local value="${line#*=}"
+  value="$(trim_quotes "$value")"
+  echo "$value"
+}
+
 generate_minio_ak_sk() {
+  if [ -n "${MINIO_ACCESS_KEY:-}" ] && [ -n "${MINIO_SECRET_KEY:-}" ]; then
+    echo "🔑 Reusing existing MinIO keys."
+    return 0
+  fi
+
   echo "🔑 Generating MinIO keys..."
 
   if [ "$(uname -s | tr '[:upper:]' '[:lower:]')" = "mingw" ] || [ "$(uname -s | tr '[:upper:]' '[:lower:]')" = "msys" ]; then
@@ -321,10 +347,19 @@ generate_jwt() {
 
 generate_supabase_keys() {
   if [ "$DEPLOYMENT_VERSION" = "full" ]; then
+    if [ -n "${JWT_SECRET:-}" ] &&
+       [ -n "${SECRET_KEY_BASE:-}" ] &&
+       [ -n "${VAULT_ENC_KEY:-}" ] &&
+       [ -n "${SUPABASE_KEY:-}" ] &&
+       [ -n "${SERVICE_ROLE_KEY:-}" ]; then
+      echo "🔑 Reusing existing Supabase keys."
+      return 0
+    fi
+
     # Function to generate Supabase secrets
     echo "🔑 Generating Supabase keys..."
 
-    # Generate fresh keys on every run for security
+    # Generate fresh keys only when they are not already configured.
     export JWT_SECRET=$(openssl rand -base64 32 | tr -d '[:space:]')
     export SECRET_KEY_BASE=$(openssl rand -base64 64 | tr -d '[:space:]')
     export VAULT_ENC_KEY=$(openssl rand -base64 32 | tr -d '[:space:]')
@@ -350,6 +385,15 @@ generate_supabase_keys() {
 generate_elasticsearch_api_key() {
   # Function to generate Elasticsearch API key
   wait_for_elasticsearch_healthy || { echo "   ❌ Elasticsearch health check failed"; return 0; }
+
+  if [ -n "${ELASTICSEARCH_API_KEY:-}" ]; then
+    echo "🔑 Checking existing ELASTICSEARCH_API_KEY..."
+    if docker exec nexent-elasticsearch curl -sf -H "Authorization: ApiKey ${ELASTICSEARCH_API_KEY}" "http://localhost:9200/_security/_authenticate" >/dev/null 2>&1; then
+      echo "   ✅ Existing ELASTICSEARCH_API_KEY is valid, reusing it."
+      return 0
+    fi
+    echo "   ⚠️  Existing ELASTICSEARCH_API_KEY is invalid or expired, generating a new one."
+  fi
 
   # Generate API key
   echo "🔑 Generating ELASTICSEARCH_API_KEY..."
@@ -551,6 +595,12 @@ update_env_var() {
 
   # Ensure the .env file exists
   touch "$env_file"
+
+  local current_value
+  current_value="$(get_env_var_from_file "$key" "$env_file")"
+  if [ "$current_value" = "$value" ]; then
+    return 0
+  fi
 
   if grep -q "^${key}=" "$env_file"; then
     # Key exists, so update it. Escape \ and & for sed's replacement string.
